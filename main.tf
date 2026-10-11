@@ -1,54 +1,76 @@
+# Security Group des instances : HTTP depuis l'ALB uniquement, aucun SSH
 resource "aws_security_group" "this" {
-  name        = "novasphere-${var.name}"
-  description = "Regles du serveur ${var.name}"
+  name_prefix = "${var.name}-"
+  description = "Instances : HTTP depuis ALB uniquement, aucun SSH"
+  vpc_id      = var.vpc_id
 
   ingress {
-    description = "SSH restreint"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.admin_cidr]
-  }
-
-  dynamic "ingress" {
-    for_each = var.open_ports
-    content {
-      description = "Port ${ingress.value} public"
-      from_port   = ingress.value
-      to_port     = ingress.value
-      protocol    = "tcp"
-      cidr_blocks = ["0.0.0.0/0"]
-    }
-  }
-
-  # NOUVEAU v1.1.0 : port 9100 ouvert a l'admin seulement, si l'option est activee
-  dynamic "ingress" {
-    for_each = var.enable_monitoring_port ? [9100] : []
-    content {
-      description = "node exporter, administration seulement"
-      from_port   = ingress.value
-      to_port     = ingress.value
-      protocol    = "tcp"
-      cidr_blocks = [var.admin_cidr]
-    }
+    description     = "HTTP depuis ALB uniquement"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [var.alb_security_group_id]
   }
 
   egress {
+    description = "Sortie vers Internet (paquets, Parameter Store)"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = merge(var.tags, { Name = var.name })
+
+  # Le nouveau SG est cree avant la suppression de l'ancien : pas de coupure
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
-resource "aws_instance" "this" {
-  ami                    = var.ami_id
+# Modele d'instance
+resource "aws_launch_template" "this" {
+  name_prefix            = "${var.name}-"
+  image_id               = var.ami_id
   instance_type          = var.instance_type
-  key_name               = var.key_name
   vpc_security_group_ids = [aws_security_group.this.id]
+  user_data              = base64encode(var.user_data)
 
-  tags = merge(var.tags, {
-    Name = "novasphere-${var.name}"
-    Role = var.name
-  })
+  metadata_options {
+    http_tokens = "required" # IMDSv2 exige
+  }
+
+  dynamic "iam_instance_profile" {
+    for_each = var.iam_instance_profile_name == null ? [] : [var.iam_instance_profile_name]
+    content {
+      name = iam_instance_profile.value
+    }
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = merge(var.tags, { Name = var.name })
+  }
+}
+
+# Groupe d'auto-scaling : remplace les instances que l'ALB declare malades
+resource "aws_autoscaling_group" "this" {
+  name                = var.name
+  min_size            = var.min_size
+  max_size            = var.max_size
+  desired_capacity    = var.desired_capacity
+  vpc_zone_identifier = var.subnet_ids
+  target_group_arns   = var.target_group_arns
+  health_check_type   = "ELB"
+
+  launch_template {
+    id      = aws_launch_template.this.id
+    version = aws_launch_template.this.latest_version
+  }
+
+  tag {
+    key                 = "Name"
+    value               = var.name
+    propagate_at_launch = true
+  }
 }
